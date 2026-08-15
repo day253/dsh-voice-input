@@ -1,0 +1,25 @@
+{
+  "name": "dsh-voice-input",
+  "version": "1.0.0",
+  "description": "给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web GUI 加一个**手机端语音输入**插件：点一下输入框旁的麦克风，说话，再点一下，语音自动识别成文字写进输入框——手机上再也不用打字了。",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/day253/dsh-voice-input.git"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/day253/dsh-voice-input/issues"
+  },
+  "homepage": "https://github.com/day253/dsh-voice-input#readme",
+  "devDependencies": {
+    "puppeteer-core": "^25.7.0"
+  }
+}
