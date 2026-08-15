@@ -1,0 +1,7 @@
+.venv/
+node_modules/
+credentials.json
+*.pcm
+*.wav
+*.webm
+*.ogg
