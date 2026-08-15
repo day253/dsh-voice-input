@@ -10,17 +10,25 @@
  * 免责声明：该协议并非公开、稳定的商业 API，服务端行为可能随时变化，仅供学习研究。
  * 凭据文件勿提交到 Git、勿复制到其他机器。
  *
- * 用途：被 DeepSeek Harness 的 dsh-voice-input 插件以子进程方式调用。
- * 输入（stdin）：一行 JSON
- *   {"packets": ["<base64 opus 包>", ...], "cache_dir": "<凭据缓存目录>"}
- * 输出（stdout）：一行 JSON
- *   {"ok": true, "text": "..."}  或  {"ok": false, "error": "..."}
+ * 流式行协议（被 DeepSeek Harness 的 dsh-voice-input 插件以子进程方式调用）：
+ *
+ * stdin（每行一个 JSON）：
+ *   {"type":"start"}                                 开启一次 ASR 会话
+ *   {"type":"packets","packets":["<base64 opus 包>"]}  追加音频（实时发送）
+ *   {"type":"finish"}                                结束：标记 LAST 帧并 FinishSession
+ * stdout（每行一个 JSON）：
+ *   {"type":"ready"}                             会话已就绪（可开始发音频）
+ *   {"type":"interim","text":"..."}              中间识别结果（实时上屏）
+ *   {"type":"final","text":"..."}                最终结果（可能多次，取最后一次）
+ *   {"type":"done"}                              会话结束
+ *   {"type":"error","error":"..."}               出错（随后退出）
  */
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { promises as fsp } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createInterface } from 'node:readline'
 
 const REGISTER_URL = 'https://log.snssdk.com/service/2/device_register/'
 const SETTINGS_URL = 'https://is.snssdk.com/service/settings/v3/'
@@ -60,21 +68,26 @@ const USER_AGENT =
 const SAMPLE_RATE = 16000
 const FRAME_MS = 20
 
+const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\n')
+const fail = (message) => {
+  out({ type: 'error', error: String(message).slice(0, 500) })
+  setTimeout(() => process.exit(1), 60)
+}
+
 // ---------------------------------------------------------------------------
 // protobuf（手写，schema 见 doubaoime-asr 的 asr.proto）
 // ---------------------------------------------------------------------------
 
 function varint(n) {
-  const out = []
+  const outArr = []
   let v = BigInt(n) & 0xffffffffffffffffn
   while (true) {
-    let b = Number(v & 0x7fn)
+    const b = Number(v & 0x7fn)
     v >>= 7n
-    if (v) out.push(b | 0x80)
-    else { out.push(b); return Buffer.from(out) }
+    if (v) outArr.push(b | 0x80)
+    else { outArr.push(b); return Buffer.from(outArr) }
   }
 }
-
 function pbField(field, wire, payload) {
   return Buffer.concat([varint((field << 3) | wire), payload])
 }
@@ -89,7 +102,6 @@ function pbBytes(field, value) {
 function pbInt(field, value) {
   return pbField(field, 0, varint(value))
 }
-
 function encodeAsrRequest({ token = '', method, payload = '', audio = null, requestId, frameState = null }) {
   const parts = []
   if (token) parts.push(pbStr(2, token))
@@ -101,7 +113,6 @@ function encodeAsrRequest({ token = '', method, payload = '', audio = null, requ
   if (frameState !== null) parts.push(pbInt(9, frameState))
   return Buffer.concat(parts)
 }
-
 function decodeAsrResponse(buf) {
   const result = {}
   let i = 0
@@ -148,11 +159,9 @@ async function postJson(url, params, body, headers) {
   try { data = JSON.parse(text) } catch { throw new Error(`响应不是 JSON（HTTP ${res.status}）: ${text.slice(0, 120)}`) }
   return data
 }
-
 function genIds() {
   return { cdid: randomUUID(), openudid: randomBytes(8).toString('hex'), clientudid: randomUUID() }
 }
-
 async function registerDevice() {
   const ids = genIds()
   const nowMs = Date.now()
@@ -184,7 +193,6 @@ async function registerDevice() {
   if (!deviceId) throw new Error(`device_register 返回异常: ${JSON.stringify(resp).slice(0, 200)}`)
   return { device_id: String(deviceId), install_id: String(installId), ...ids, token: '' }
 }
-
 async function fetchToken(creds) {
   const params = {
     device_platform: 'android', os: 'android', ssmix: 'a', _rticket: String(Date.now()),
@@ -199,13 +207,10 @@ async function fetchToken(creds) {
   if (!appKey) throw new Error(`settings 未返回 app_key: ${JSON.stringify(data).slice(0, 200)}`)
   return appKey
 }
-
 async function loadOrRegisterCredentials(cacheDir) {
   const file = path.join(cacheDir, 'credentials.json')
   let creds = null
-  try {
-    creds = JSON.parse(await fsp.readFile(file, 'utf8'))
-  } catch { creds = null }
+  try { creds = JSON.parse(await fsp.readFile(file, 'utf8')) } catch { creds = null }
   if (creds?.device_id && creds?.token) return { creds, file }
   creds = await registerDevice()
   creds.token = await fetchToken(creds)
@@ -239,154 +244,197 @@ function openWs(url) {
   })
 }
 
-function recvMessage(ws, timeoutMs = 30000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { cleanup(); reject(new Error('WS 接收超时')) }, timeoutMs)
-    const onMsg = (ev) => { cleanup(); resolve(new Uint8Array(ev.data)) }
-    const onErr = () => { cleanup(); reject(new Error('WS 连接出错')) }
-    const onClose = (ev) => { cleanup(); reject(new Error(`WS 连接关闭 (code ${ev.code})`)) }
-    const cleanup = () => {
-      clearTimeout(timer)
-      ws.removeEventListener('message', onMsg)
-      ws.removeEventListener('error', onErr)
-      ws.removeEventListener('close', onClose)
+// ---------------------------------------------------------------------------
+// 流式 ASR 会话
+// ---------------------------------------------------------------------------
+
+let ws = null
+let requestId = null
+let creds = null
+let credsFile = null
+let cacheDir = null
+let frameIndex = 0
+let sessionStartMs = 0
+let sessionActive = false
+
+function handleWsMessage(ev) {
+  let resp
+  try {
+    resp = decodeAsrResponse(new Uint8Array(ev.data))
+  } catch (e) {
+    out({ type: 'error', error: 'ASR 响应解析失败: ' + String(e.message || e) })
+    return
+  }
+  if (resp.message_type === 'TaskFailed' || resp.message_type === 'SessionFailed') {
+    out({ type: 'error', error: '会话失败: ' + resp.status_message })
+    return
+  }
+  if (resp.message_type === 'SessionFinished') {
+    sessionActive = false
+    out({ type: 'done' })
+    setTimeout(() => process.exit(0), 80)
+    return
+  }
+  if (!resp.result_json) return
+  let data
+  try { data = JSON.parse(resp.result_json) } catch { return }
+  const results = data.results
+  if (!results) return
+  let text = '', isInterim = true, vadFinished = false, nonstream = false
+  for (const r of results) {
+    if (r.text) text = r.text
+    if (r.is_interim === false) isInterim = false
+    if (r.is_vad_finished) vadFinished = true
+    if (r.extra?.nonstream_result) nonstream = true
+  }
+  if (nonstream || (!isInterim && vadFinished)) out({ type: 'final', text })
+  else out({ type: 'interim', text })
+}
+
+function attachWs(ws) {
+  ws.addEventListener('message', handleWsMessage)
+  ws.addEventListener('close', () => {
+    if (sessionActive) {
+      sessionActive = false
+      out({ type: 'error', error: 'WS 连接被服务端关闭' })
+      setTimeout(() => process.exit(1), 80)
     }
-    ws.addEventListener('message', onMsg)
-    ws.addEventListener('error', onErr)
-    ws.addEventListener('close', onClose)
   })
 }
 
-// ---------------------------------------------------------------------------
-// ASR 会话
-// ---------------------------------------------------------------------------
-
-async function runSession(creds, packets) {
-  const url = `${WS_URL}?aid=${AID}&device_id=${creds.device_id}`
-  const ws = await openWs(url)
-  const requestId = randomUUID()
-  try {
-    ws.send(encodeAsrRequest({ token: creds.token, method: 'StartTask', requestId }))
-    let resp = decodeAsrResponse(await recvMessage(ws))
-    if (resp.message_type === 'TaskFailed' || resp.message_type === 'SessionFailed') {
-      throw new Error(`StartTask 失败: ${resp.status_message}`)
-    }
-    if (resp.message_type !== 'TaskStarted') throw new Error(`StartTask 返回异常: ${resp.message_type}`)
-
-    const sessionPayload = JSON.stringify({
-      audio_info: { channel: 1, format: 'speech_opus', sample_rate: SAMPLE_RATE },
-      enable_punctuation: true,
-      enable_speech_rejection: false,
-      extra: {
-        app_name: 'com.android.chrome',
-        cell_compress_rate: 8,
-        did: creds.device_id,
-        enable_asr_threepass: true,
-        enable_asr_twopass: true,
-        input_mode: 'tool',
-      },
-    })
-    ws.send(encodeAsrRequest({ token: creds.token, method: 'StartSession', payload: sessionPayload, requestId }))
-    resp = decodeAsrResponse(await recvMessage(ws))
-    if (resp.message_type === 'TaskFailed' || resp.message_type === 'SessionFailed') {
-      throw new Error(`StartSession 失败: ${resp.status_message}`)
-    }
-    if (resp.message_type !== 'SessionStarted') throw new Error(`StartSession 返回异常: ${resp.message_type}`)
-
-    const startMs = Date.now()
-    const n = packets.length
-    for (let i = 0; i < n; i++) {
-      const state = i === 0 ? 1 : (i === n - 1 ? 9 : 3) // FIRST / LAST / MIDDLE
-      const payload = JSON.stringify({ extra: {}, timestamp_ms: startMs + i * FRAME_MS })
-      ws.send(encodeAsrRequest({ method: 'TaskRequest', payload, audio: packets[i], requestId, frameState: state }))
-    }
-    ws.send(encodeAsrRequest({ token: creds.token, method: 'FinishSession', requestId }))
-
-    let finalText = ''
-    let lastInterim = ''
-    while (true) {
-      resp = decodeAsrResponse(await recvMessage(ws))
-      if (resp.message_type === 'TaskFailed' || resp.message_type === 'SessionFailed') {
-        throw new Error(`会话失败: ${resp.status_message}`)
-      }
-      if (resp.message_type === 'SessionFinished') break
-      if (!resp.result_json) continue
-      let data
-      try { data = JSON.parse(resp.result_json) } catch { continue }
-      const results = data.results
-      if (!results) continue
-      let text = '', isInterim = true, vadFinished = false, nonstream = false
-      for (const r of results) {
-        if (r.text) text = r.text
-        if (r.is_interim === false) isInterim = false
-        if (r.is_vad_finished) vadFinished = true
-        if (r.extra?.nonstream_result) nonstream = true
-      }
-      if (nonstream || (!isInterim && vadFinished)) finalText = text
-      else lastInterim = text
-    }
-    return finalText || lastInterim
-  } finally {
-    try { ws.close() } catch {}
+function sendPackets(packets, lastOne) {
+  for (let i = 0; i < packets.length; i++) {
+    let state = 3 // MIDDLE
+    if (frameIndex === 0) state = 1 // FIRST
+    if (lastOne && i === packets.length - 1) state = 9 // LAST
+    const payload = JSON.stringify({ extra: {}, timestamp_ms: sessionStartMs + frameIndex * FRAME_MS })
+    ws.send(encodeAsrRequest({ method: 'TaskRequest', payload, audio: packets[i], requestId, frameState: state }))
+    frameIndex++
   }
 }
 
-async function transcribe(packets, cacheDir) {
-  const { creds, file } = await loadOrRegisterCredentials(cacheDir)
+async function startSession() {
+  if (sessionActive) {
+    out({ type: 'ready' })
+    return
+  }
+  const loaded = await loadOrRegisterCredentials(cacheDir)
+  creds = loaded.creds
+  credsFile = loaded.file
+  const url = `${WS_URL}?aid=${AID}&device_id=${creds.device_id}`
+  ws = await openWs(url)
+  attachWs(ws)
+  requestId = randomUUID()
+  frameIndex = 0
+  sessionStartMs = Date.now()
+
+  ws.send(encodeAsrRequest({ token: creds.token, method: 'StartTask', requestId }))
+  const taskResp = await new Promise((resolve, reject) => {
+    const onMsg = (ev) => {
+      ws.removeEventListener('message', onMsg)
+      try { resolve(decodeAsrResponse(new Uint8Array(ev.data))) } catch (e) { reject(e) }
+    }
+    const onErr = () => { ws.removeEventListener('message', onMsg); reject(new Error('WS 出错')) }
+    ws.addEventListener('message', onMsg)
+    ws.addEventListener('error', onErr, { once: true })
+  })
+  if (taskResp.message_type === 'TaskFailed' || taskResp.message_type === 'SessionFailed') {
+    throw new Error(`StartTask 失败: ${taskResp.status_message}`)
+  }
+  if (taskResp.message_type !== 'TaskStarted') throw new Error(`StartTask 返回异常: ${taskResp.message_type}`)
+
+  const sessionPayload = JSON.stringify({
+    audio_info: { channel: 1, format: 'speech_opus', sample_rate: SAMPLE_RATE },
+    enable_punctuation: true,
+    enable_speech_rejection: false,
+    extra: {
+      app_name: 'com.android.chrome',
+      cell_compress_rate: 8,
+      did: creds.device_id,
+      enable_asr_threepass: true,
+      enable_asr_twopass: true,
+      input_mode: 'tool',
+    },
+  })
+  ws.send(encodeAsrRequest({ token: creds.token, method: 'StartSession', payload: sessionPayload, requestId }))
+  const sessResp = await new Promise((resolve, reject) => {
+    const onMsg = (ev) => {
+      ws.removeEventListener('message', onMsg)
+      try { resolve(decodeAsrResponse(new Uint8Array(ev.data))) } catch (e) { reject(e) }
+    }
+    const onErr = () => { ws.removeEventListener('message', onMsg); reject(new Error('WS 出错')) }
+    ws.addEventListener('message', onMsg)
+    ws.addEventListener('error', onErr, { once: true })
+  })
+  if (sessResp.message_type === 'TaskFailed' || sessResp.message_type === 'SessionFailed') {
+    throw new Error(`StartSession 失败: ${sessResp.status_message}`)
+  }
+  if (sessResp.message_type !== 'SessionStarted') throw new Error(`StartSession 返回异常: ${sessResp.message_type}`)
+
+  sessionActive = true
+  out({ type: 'ready' })
+}
+
+async function retryWithFreshCredentials(fn) {
   try {
-    return await runSession(creds, packets)
+    await fn()
   } catch (firstError) {
-    // 凭据可能过期：重新注册一次再试
     try {
       const fresh = await registerDevice()
       fresh.token = await fetchToken(fresh)
-      await fsp.writeFile(file, JSON.stringify(fresh, null, 2))
-      return await runSession(fresh, packets)
+      await fsp.writeFile(credsFile, JSON.stringify(fresh, null, 2))
+      creds = fresh
+      if (ws) { try { ws.close() } catch {} }
+      await fn()
     } catch (secondError) {
-      throw new Error(`${firstError.message}; 重试: ${secondError.message}`)
+      fail(`${firstError.message}; 重试: ${secondError.message}`)
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// 入口
+// stdin 行协议入口
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const chunks = []
-  for await (const chunk of process.stdin) chunks.push(chunk)
-  const raw = Buffer.concat(chunks).toString('utf8').trim()
-  if (!raw) {
-    console.log(JSON.stringify({ ok: false, error: 'stdin 为空' }))
-    return
+  const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
+  const cacheDirArg = process.argv[2]
+  cacheDir = cacheDirArg || path.join(os.homedir(), '.cache', 'dsh-voice')
+
+  for await (const line of rl) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let msg
+    try { msg = JSON.parse(trimmed) } catch (e) {
+      fail(`请求不是合法 JSON: ${e.message}`)
+      return
+    }
+    try {
+      if (msg.type === 'start') {
+        await retryWithFreshCredentials(startSession)
+      } else if (msg.type === 'packets') {
+        if (!sessionActive) fail('会话未开启，请先发送 start')
+        const packets = (Array.isArray(msg.packets) ? msg.packets : [])
+          .map((p) => Buffer.from(String(p), 'base64'))
+          .filter((p) => p.length > 0)
+        if (packets.length) sendPackets(packets, false)
+      } else if (msg.type === 'finish') {
+        if (!sessionActive) fail('会话未开启，请先发送 start')
+        const packets = (Array.isArray(msg.packets) ? msg.packets : [])
+          .map((p) => Buffer.from(String(p), 'base64'))
+          .filter((p) => p.length > 0)
+        sendPackets(packets, packets.length > 0)
+        ws.send(encodeAsrRequest({ token: creds.token, method: 'FinishSession', requestId }))
+      } else {
+        fail(`未知消息类型: ${msg.type}`)
+      }
+    } catch (e) {
+      fail(String(e?.message || e))
+      return
+    }
   }
-  let req
-  try { req = JSON.parse(raw) } catch (e) {
-    console.log(JSON.stringify({ ok: false, error: `请求不是合法 JSON: ${e.message}` }))
-    return
-  }
-  const cacheDir = req.cache_dir || path.join(os.homedir(), '.cache', 'dsh-voice')
-  if (!Array.isArray(req.packets) || req.packets.length === 0) {
-    console.log(JSON.stringify({ ok: false, error: '缺少 packets 字段' }))
-    return
-  }
-  let packets
-  try {
-    packets = req.packets.map((p) => Buffer.from(String(p), 'base64'))
-  } catch (e) {
-    console.log(JSON.stringify({ ok: false, error: `packets base64 解码失败: ${e.message}` }))
-    return
-  }
-  if (!packets.some((p) => p.length > 0)) {
-    console.log(JSON.stringify({ ok: false, error: 'packets 为空' }))
-    return
-  }
-  try {
-    const text = await transcribe(packets, cacheDir)
-    console.log(JSON.stringify({ ok: true, text }))
-  } catch (e) {
-    console.log(JSON.stringify({ ok: false, error: String(e?.message || e).slice(0, 500) }))
-  }
+  // stdin 关闭（宿主终止进程）→ 退出
+  process.exit(0)
 }
 
-await main()
+main()

@@ -1,9 +1,11 @@
 // dsh-voice-input — 客户端（Client half）
 // 作为 DeepSeek Harness 动态 Cordis 插件的 client 代码使用。
-// 职责：在输入框工具行（conversation.input.right）注册一个麦克风按钮；
-// 点按录音（MediaRecorder 产出 Opus 的 webm/ogg），停止后从容器中提取
-// Opus 包，经 host.call('transcribe') 交给宿主端识别，结果写入输入框。
+// 职责：在输入框工具行注册一个麦克风按钮（conversation.input.right）。
+// 点击即开始“持续识别”：分段录音（每段 ~1.5s，各自是完整 webm/ogg），
+// Opus 包边录边发给宿主；中间结果实时写入输入框；再次点击结束，
+// 最终文本自动填入并自动发送。
 return {
+  inject: ['timer'],
   apply(ctx) {
     const slots = ctx.get('slots')
     if (slots === undefined) return
@@ -166,58 +168,156 @@ return {
       .dv-mic-err { position: absolute; bottom: calc(100% + 6px); right: 0; max-width: 240px; background: #b3261e; color: #fff; font-size: 12px; line-height: 1.4; padding: 6px 8px; border-radius: 6px; z-index: 50; }
     `))
 
-    const runtime = { recorder: null, mimeType: null }
+    const runtime = {
+      recorder: null,
+      mimeType: null,
+      stream: null,
+      chunkBytes: null,
+      active: false,
+      segmentStartedAt: 0,
+      totalElapsed: 0,
+      lastInterim: '',
+      finishing: false,
+    }
 
     function MicButton(props) {
       const [status, setStatus] = React.useState('idle')
       const [error, setError] = React.useState(null)
 
       React.useEffect(() => () => {
+        runtime.active = false
         if (runtime.recorder && runtime.recorder.state === 'recording') {
           try { runtime.recorder.stop() } catch (e) {}
         }
+        if (runtime.stream) {
+          runtime.stream.getTracks().forEach((t) => { try { t.stop() } catch (e) {} })
+        }
       }, [])
 
-      const finish = (blob) => {
-        setStatus('processing')
-        setError(null)
-        blob.arrayBuffer().then((ab) => {
-          let packets
-          try {
-            const bytes = new Uint8Array(ab)
-            packets = runtime.mimeType.indexOf('ogg') >= 0
-              ? extractOpusPacketsFromOgg(bytes)
-              : extractOpusPacketsFromWebm(bytes)
-          } catch (e) {
-            setError('音频解析失败：' + String((e && e.message) || e))
-            setStatus('idle')
-            return
-          }
-          if (!packets.length) {
-            setError('没有提取到有效音频，请靠近麦克风重试')
-            setStatus('idle')
-            return
-          }
-          host.call('transcribe', { packets: packets.map((p) => b64encode(p)) }).then((res) => {
-            if (res && res.ok === true && res.text) {
-              props.inputActions.setDraft(res.text)
-              setStatus('idle')
-            } else {
-              setError((res && res.error) || '语音识别失败')
-              setStatus('idle')
-            }
-          }).catch((e) => {
-            setError('语音识别调用失败：' + String((e && e.message) || e))
-            setStatus('idle')
-          })
-        }).catch((e) => {
-          setError('读取录音失败：' + String((e && e.message) || e))
-          setStatus('idle')
-        })
+      const parseSegment = () => {
+        if (!runtime.chunkBytes || runtime.chunkBytes.length === 0) return []
+        let total = 0
+        for (const b of runtime.chunkBytes) total += b.length
+        const bytes = new Uint8Array(total)
+        let off = 0
+        for (const b of runtime.chunkBytes) { bytes.set(b, off); off += b.length }
+        try {
+          return runtime.mimeType.indexOf('ogg') >= 0
+            ? extractOpusPacketsFromOgg(bytes)
+            : extractOpusPacketsFromWebm(bytes)
+        } catch (e) {
+          return []
+        }
       }
 
-      const start = () => {
+      const finishRecording = async () => {
+        if (runtime.finishing) return
+        runtime.finishing = true
+        try {
+          setStatus('processing')
+          setError(null)
+          let res
+          try {
+            res = await host.call('asrFinish', { packets: [] })
+          } catch (e) {
+            setError('识别结束调用失败：' + String((e && e.message) || e))
+            setStatus('idle')
+            return
+          }
+          if (res && res.error) {
+            setError(res.error)
+            setStatus('idle')
+            return
+          }
+          const text = (res && res.final) || runtime.lastInterim || ''
+          if (text) {
+            props.inputActions.setDraft(text)
+            try { props.inputActions.submit() } catch (e) {} // 自动发送
+          } else {
+            setError('没有识别到内容')
+          }
+          setStatus('idle')
+        } finally {
+          runtime.finishing = false
+        }
+      }
+
+      const startSegment = () => {
+        if (!runtime.active || !runtime.stream) return
+        runtime.segmentStartedAt = Date.now()
+        runtime.chunkBytes = []
+        let recorder
+        try {
+          recorder = new MediaRecorder(runtime.stream, { mimeType: runtime.mimeType })
+        } catch (e) {
+          setError('无法启动录音：' + String((e && e.message) || e))
+          runtime.active = false
+          return
+        }
+        runtime.recorder = recorder
+        let segmentTimer = null
+        recorder.ondataavailable = (ev) => {
+          if (ev.data && ev.data.size > 0) {
+            ev.data.arrayBuffer().then((ab) => {
+              runtime.chunkBytes.push(new Uint8Array(ab))
+            }).catch(() => {})
+          }
+        }
+        recorder.onstop = async () => {
+          if (segmentTimer) { segmentTimer(); segmentTimer = null }
+          await ctx.timeout(60) // 等本段数据全部落定
+          const packets = parseSegment()
+          if (packets.length) {
+            let res
+            try {
+              res = await host.call('asrChunk', { packets: packets.map(b64encode) })
+            } catch (e) {
+              setError('识别调用失败：' + String((e && e.message) || e))
+              runtime.active = false
+              setStatus('idle')
+              return
+            }
+            if (res && res.interim) {
+              runtime.lastInterim = res.interim
+              props.inputActions.setDraft(res.interim) // 中间结果实时上屏
+            }
+            if (res && res.error) {
+              setError(res.error)
+              runtime.active = false
+              setStatus('idle')
+              return
+            }
+          }
+          runtime.totalElapsed += Date.now() - runtime.segmentStartedAt
+          if (runtime.active && runtime.totalElapsed < 60000) {
+            startSegment() // 继续下一段
+          } else if (!runtime.active) {
+            finishRecording()
+          } else {
+            finishRecording() // 60 秒兜底自动结束
+          }
+        }
+        recorder.start()
+        segmentTimer = ctx.timeout(() => {
+          if (runtime.recorder === recorder && recorder.state === 'recording') {
+            try { recorder.stop() } catch (e) {}
+          }
+        }, 1500)
+      }
+
+      const stopAll = () => {
+        runtime.active = false
+        if (runtime.recorder && runtime.recorder.state === 'recording') {
+          try { runtime.recorder.stop() } catch (e) {}
+        } else if (!runtime.recorder) {
+          finishRecording()
+        }
+      }
+
+      const start = async () => {
         setError(null)
+        runtime.lastInterim = ''
+        runtime.totalElapsed = 0
         if (typeof navigator === 'undefined' || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
           setError('当前浏览器不支持麦克风（需 HTTPS）')
           return
@@ -233,39 +333,44 @@ return {
           setError('当前浏览器不支持 Opus 录音（iOS Safari 请使用系统听写）')
           return
         }
-        navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }).then((stream) => {
-          const chunks = []
-          const recorder = new MediaRecorder(stream, { mimeType })
-          runtime.recorder = recorder
-          runtime.mimeType = mimeType
-          recorder.ondataavailable = (ev) => {
-            if (ev.data && ev.data.size > 0) chunks.push(ev.data)
-          }
-          recorder.onstop = () => {
-            stream.getTracks().forEach((t) => { try { t.stop() } catch (e) {} })
-            runtime.recorder = null
-            finish(new Blob(chunks, { type: mimeType }))
-          }
-          recorder.start()
-          setStatus('recording')
-        }).catch((e) => {
+        let stream
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+        } catch (e) {
           setError('无法访问麦克风：' + String((e && e.message) || e))
-          setStatus('idle')
-        })
+          return
+        }
+        // 先开启 ASR 会话：点击就开始持续识别
+        let started
+        try {
+          started = await host.call('asrStart')
+        } catch (e) {
+          stream.getTracks().forEach((t) => { try { t.stop() } catch (err) {} })
+          setError('识别服务启动失败：' + String((e && e.message) || e))
+          return
+        }
+        if (!started || started.ok !== true) {
+          stream.getTracks().forEach((t) => { try { t.stop() } catch (err) {} })
+          setError((started && started.error) || '识别服务启动失败')
+          return
+        }
+        runtime.stream = stream
+        runtime.mimeType = mimeType
+        runtime.active = true
+        setStatus('recording')
+        startSegment()
       }
 
       const onClick = () => {
         if (status === 'processing') return
         if (status === 'recording') {
-          if (runtime.recorder) {
-            try { runtime.recorder.stop() } catch (e) {}
-          }
+          stopAll()
           return
         }
         start()
       }
 
-      const label = status === 'recording' ? '停止并识别' : status === 'processing' ? '识别中…' : '语音输入'
+      const label = status === 'recording' ? '停止并发送' : status === 'processing' ? '识别中…' : '语音输入'
 
       return React.createElement('span', { className: 'dv-mic-wrap', title: label },
         error ? React.createElement('span', { className: 'dv-mic-err', onClick: () => setError(null) }, error) : null,
